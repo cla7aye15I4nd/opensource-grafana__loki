@@ -54,7 +54,7 @@ var tracer = otel.Tracer("pkg/dataobj/metastore")
 
 // ObjectMetastore is a metastore that stores data objects in object storage.
 type ObjectMetastore struct {
-	bucket      objstore.Bucket
+	bucket      objstore.BucketReader
 	parallelism int
 	logger      log.Logger
 	metrics     *ObjectMetastoreMetrics
@@ -238,7 +238,7 @@ func NewObjectMetastore(b objstore.Bucket, cfg Config, logger log.Logger, metric
 	}
 
 	store := &ObjectMetastore{
-		bucket:      b,
+		bucket:      dataobj.NewInstrumentedBucketReader(b),
 		parallelism: 64,
 		logger:      logger,
 		metrics:     metrics,
@@ -609,9 +609,17 @@ func dedupeAndSortEntries(batches [][]IndexEntry) []IndexEntry {
 	return entries
 }
 
-func (m *ObjectMetastore) Sections(ctx context.Context, req SectionsRequest) (SectionsResponse, error) {
-	ctx, span := xcap.StartSpan(ctx, tracer, "metastore.Sections")
+func (m *ObjectMetastore) Sections(ctx context.Context, req SectionsRequest) (_ SectionsResponse, returnErr error) {
+	ctx, span := xcap.StartSpan(ctx, tracer, RegionSections)
 	defer span.End()
+
+	start := time.Now()
+	// This runs before span.End, which stops the region from recording.
+	defer func() {
+		if returnErr == nil {
+			span.Record(StatMetastoreSectionsDuration.Observe(int64(time.Since(start))))
+		}
+	}()
 
 	sectionsTimer := prometheus.NewTimer(m.metrics.resolvedSectionsTotalDuration)
 
@@ -754,9 +762,16 @@ func hasPostingsSection(obj *dataobj.Object, tenant string) bool {
 	return false
 }
 
-func (m *ObjectMetastore) GetIndexes(ctx context.Context, req GetIndexesRequest) (GetIndexesResponse, error) {
+func (m *ObjectMetastore) GetIndexes(ctx context.Context, req GetIndexesRequest) (_ GetIndexesResponse, returnErr error) {
 	ctx, span := xcap.StartSpan(ctx, tracer, "metastore.GetIndexes")
 	defer span.End()
+	timer := prometheus.NewTimer(m.metrics.getIndexesTotalDuration)
+	// This runs before span.End, which stops the region from recording.
+	defer func() {
+		if returnErr == nil {
+			timer.ObserveDuration()
+		}
+	}()
 
 	tenantID, err := tenant.TenantID(ctx)
 	if err != nil {
